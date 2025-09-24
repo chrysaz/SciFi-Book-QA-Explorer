@@ -1,4 +1,4 @@
-import os 
+import os
 import logging
 from dotenv import load_dotenv
 from langchain_openai import OpenAIEmbeddings, ChatOpenAI
@@ -10,115 +10,153 @@ from langchain_core.runnables import RunnablePassthrough
 from langchain_core.prompts import ChatPromptTemplate
 
 
-# Ensure logs folder exists
-os.makedirs("logs", exist_ok=True)
+class SciFiExplorer:
+    """A class for exploring and answering questions about a collection of science fiction books using LLMs and vector search."""
 
-# Configure logging using the setup_logger utility
-logging.basicConfig(filename="logs/app.log",
-    filemode="a", 
-    level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
-)
+    def __init__(self, data_folder="data", persist_directory="db/faiss_index"):
+        """
+        Initializes the SciFiExplorer.
 
-# Load environment variables from a .env file
-load_dotenv()
-
-#load books
-folder = "data"
-documents = []
-
-for filename in os.listdir(folder):  
-    filepath = os.path.join(folder, filename)  
-    loader = TextLoader(filepath, encoding="utf-8")
-    docs = loader.load()
-    documents.extend(docs)
-
-# Preview
-print(documents[0].metadata)
-print(documents[0].page_content[:200])
-print(len(documents))
-
-logging.info("Books loaded successfully!")
-
-# Split the document into smaller chunks
-text_splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50)
-
-# The split_documents method applies the splitting logic.
-doc_chunks = text_splitter.split_documents(documents)
-
-embeddings_model = OpenAIEmbeddings(
-    model="text-embedding-3-small",
-    openai_api_base=os.getenv("OPENAI_ENDPOINT"),
-    openai_api_key=os.getenv("OPENAI_API_KEY"),
-)
-
-def get_faiss_vector_store(documents, embedding_model, persist_directory="db/faiss_index"):
-    """
-    Create or load a FAISS vector store with persistence, similar to Chroma.
-    """
-    import os
-
-    if os.path.exists(persist_directory):
-        # Reload existing FAISS index
-        return FAISS.load_local(
-            persist_directory,
-            embedding_model,
-            allow_dangerous_deserialization=True
+        Args:
+            data_folder (str): Path to the folder containing .txt book files.
+            persist_directory (str): Directory to persist or load the FAISS vector store.
+        """
+        os.makedirs("logs", exist_ok=True)
+        logging.basicConfig(
+            filename="logs/app.log",
+            filemode="a",
+            level=logging.INFO,
+            format="%(asctime)s - %(levelname)s - %(message)s"
         )
-    else:
-        # Create a new one and save it
-        vector_store = FAISS.from_documents(documents=documents, embedding=embedding_model)
-        vector_store.save_local(persist_directory)
-        return vector_store
+        
+        load_dotenv()
 
-# Initialize FAISS with our texts and the embeddings model.exit
-vector_store = get_faiss_vector_store(
-    documents=doc_chunks,
-    embedding_model=embeddings_model,
-    persist_directory="db/faiss_index"
-)
+        logging.info(f"Loading documents from {data_folder}...")
+        self.documents = self._load_documents(data_folder)
+        logging.info(f"Loaded {len(self.documents)} documents from {data_folder}")
 
-logging.info("Vector store from books created successfully!")
+        logging.info("Splitting documents into chunks...")
+        text_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=500, chunk_overlap=50
+        )
+        doc_chunks = text_splitter.split_documents(self.documents)
+        logging.info(f"Split into {len(doc_chunks)} chunks.")
 
-# Create maximal marginal relevance (MMR) retriever
-mmr_retriever = vector_store.as_retriever(search_type="mmr", search_kwargs={"k": 3})
+        logging.info("Creating embeddings model...")
+        embeddings_model = OpenAIEmbeddings(
+            model="text-embedding-3-small",
+            openai_api_base=os.getenv("OPENAI_ENDPOINT"),
+            openai_api_key=os.getenv("OPENAI_API_KEY"),
+        )
+        
+        logging.info("Creating or loading FAISS vector store...")
+        self.vector_store = self._get_faiss_vector_store(
+            documents=doc_chunks,
+            embedding_model=embeddings_model,
+            persist_directory=persist_directory
+        )
+        logging.info("Vector store from books created successfully!")
+
+        logging.info("Initializing retriever...")
+        self.retriever = self.vector_store.as_retriever(
+            search_type="mmr",
+            search_kwargs={"k": 5}
+        )
+
+        logging.info("Initializing LLM (ChatOpenAI)...")
+        self.llm = ChatOpenAI(
+            model_name="gpt-4-turbo",
+            openai_api_base=os.getenv("OPENAI_ENDPOINT"),
+            openai_api_key=os.getenv("OPENAI_API_KEY"),
+            temperature=0
+        )
+
+        self.prompt = ChatPromptTemplate.from_template(
+            "You are a helpful assistant who answers questions strictly based on the provided context. "
+            "If the context does not contain the answer, respond with 'I don't know.'\n\n"
+            "Context:\n{context}\n\nQuestion: {question}"
+        )
+
+        self.chain = (
+            {"context": self.retriever, "question": RunnablePassthrough()}
+            | self.prompt
+            | self.llm
+            | StrOutputParser()
+        )
+
+    def _load_documents(self, folder):
+        """
+        Loads all .txt documents from a folder.
+
+        Args:
+            folder (str): Path to the folder containing .txt files.
+
+        Returns:
+            list: List of loaded document objects.
+        """
+        documents = []
+        for filename in os.listdir(folder):
+            if not filename.endswith(".txt"):
+                continue
+            filepath = os.path.join(folder, filename)
+            logging.info(f"Loading file: {filepath}")
+            loader = TextLoader(filepath, encoding="utf-8")
+            docs = loader.load()
+            logging.info(f"Loaded {len(docs)} docs from {filename}")
+            documents.extend(docs)
+        return documents
+
+    def _get_faiss_vector_store(self, documents, embedding_model, persist_directory):
+        """
+        Creates or loads a FAISS vector store from disk.
+
+        Args:
+            documents (list): List of document chunks to index.
+            embedding_model: Embedding model to use for vectorization.
+            persist_directory (str): Directory to persist/load the FAISS index.
+
+        Returns:
+            FAISS: The FAISS vector store object.
+        """
+        if os.path.exists(persist_directory):
+            logging.info(f"Loading FAISS vector store from {persist_directory}")
+            return FAISS.load_local(
+                persist_directory,
+                embedding_model,
+                allow_dangerous_deserialization=True
+            )
+        else:
+            logging.info("Creating new FAISS vector store and saving to disk...")
+            vector_store = FAISS.from_documents(documents=documents, embedding=embedding_model)
+            vector_store.save_local(persist_directory)
+            logging.info(f"Saved FAISS vector store to {persist_directory}")
+            return vector_store
+
+    def ask(self, question: str) -> str:
+        """
+        Asks a question and returns the model's answer based on the indexed book context.
+
+        Args:
+            question (str): The user's question about the books.
+
+        Returns:
+            str: The answer generated by the LLM, based on retrieved context.
+        """
+        logging.info(f"Received question: {question}")
+        return self.chain.invoke(question)
 
 
-# Initialize the Language Model (LLM) we want to use for answering
-llm = ChatOpenAI(
-    model_name="gpt-4-turbo",
-    openai_api_base=os.getenv("OPENAI_ENDPOINT"),
-    openai_api_key=os.getenv("OPENAI_API_KEY"),
-    temperature=0
-)
+if __name__ == "__main__":
+    explorer = SciFiExplorer()
 
-# Ask a question!
+    while True:
+        query = input("\nEnter your question about the books (or 'end' to quit): ")
+        if query.strip().lower() == "end":
+            print("Goodbye!")
+            logging.info("Session ended by user.")
+            break
+        answer = explorer.ask(query)
+        print(f"\nQuery: {query}")
+        print(f"Answer: {answer}")
+        logging.info(f"User query: {query}\nAnswer: {answer}")
 
-# Create your prompt
-
-prompt = ChatPromptTemplate.from_messages([
-    ("system", 
-     "You are a helpful assistant who answers questions strictly based on the provided context. "
-     "If the context does not contain the answer, respond with 'I don't know.'"),
-    ("user", "Context: {context}\n\nQuestion: {question}")
-])
-
-question = "What is the basic plot of The Shining?"
-
-retriever = mmr_retriever
-
-# Create the RetrievalQA chain
-chain = (
-    {"context": retriever, "question": RunnablePassthrough()}
-    | prompt
-    | llm
-    | StrOutputParser()
-)
-# Ask the question using the chain
-# The .invoke() method runs the entire chain.
-ret_response = chain.invoke(question)
-
-# Print out the responses
-print(f"\nQuery: {question}")
-#print(f"Specific Answer: {ret_response['result']}")
-print(f"Specific Answer: {ret_response}")
-logging.info("Query processed successfully!")
