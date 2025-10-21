@@ -1,4 +1,4 @@
-# Mini Project 1: SciFi Book QA Explorer
+# SciFi Book QA Explorer
 
 A Python project that lets you ask questions about a collection of science fiction books using modern LLM and vector search technology.
 
